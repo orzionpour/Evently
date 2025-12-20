@@ -49,7 +49,15 @@ class RouteResponse(BaseModel):
     enabled: bool
     created_at: datetime
 
+class CreateEventRequest(BaseModel):
+    type: str = Field(..., min_length=1)
+    payload: Dict[str, Any] = Field(..., min_length=1)
+    idempotency_key: Optional[str] = None
 
+class CreateEventResponse(BaseModel):
+    event_id: str
+    job_ids: List[str]
+    
 # ---------- Lifespan / DB Pool ----------
 
 @asynccontextmanager
@@ -148,3 +156,83 @@ async def list_routes():
     return out
 
 
+@app.post("/events", status_code=201, response_model=CreateEventResponse)
+async def create_event(req: CreateEventRequest):
+    pool = app.state.db_pool
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # 1) Insert event (idempotent if idempotency_key provided)
+            if req.idempotency_key:
+                event_id = await conn.fetchval(
+                    """
+                    INSERT INTO events (type, payload, idempotency_key)
+                    VALUES ($1, $2::jsonb, $3)
+                    ON CONFLICT (type, idempotency_key)
+                    WHERE idempotency_key IS NOT NULL
+                    DO UPDATE SET payload = EXCLUDED.payload
+                    RETURNING id::text
+                    """,
+                    req.type,
+                    json.dumps(req.payload),
+                    req.idempotency_key,
+                )
+            else:
+                event_id = await conn.fetchval(
+                    """
+                    INSERT INTO events (type, payload)
+                    VALUES ($1, $2::jsonb)
+                    RETURNING id::text
+                    """,
+                    req.type,
+                    json.dumps(req.payload),
+                )
+
+            # 2) Find enabled routes for this event type
+            routes = await conn.fetch(
+                """
+                SELECT id::text AS id, action_type, destination, retry_policy
+                FROM routes
+                WHERE event_type = $1 AND enabled = TRUE
+                """,
+                req.type,
+            )
+
+            job_ids: List[str] = []
+
+            # 3) Create one job per route
+            for r in routes:
+                route_id = r["id"]
+                action_type = r["action_type"]
+
+                # Parse retry_policy.max_attempts (robust: dict or string)
+                retry_policy = r["retry_policy"]
+                if isinstance(retry_policy, str):
+                    try:
+                        retry_policy = json.loads(retry_policy)
+                    except json.JSONDecodeError:
+                        retry_policy = {}
+
+                max_attempts = 5
+                if isinstance(retry_policy, dict):
+                    v = retry_policy.get("max_attempts")
+                    if isinstance(v, int) and v > 0:
+                        max_attempts = v
+
+                # Insert job. For MVP: job.payload = event.payload
+                job_id = await conn.fetchval(
+                    """
+                    INSERT INTO jobs (event_id, route_id, action_type, payload, status, attempt, max_attempts)
+                    VALUES ($1::uuid, $2::uuid, $3, $4::jsonb, 'queued', 0, $5)
+                    RETURNING id::text
+                    """,
+                    event_id,
+                    route_id,
+                    action_type,
+                    json.dumps(req.payload),
+                    max_attempts,
+                )
+
+                job_ids.append(job_id)
+
+            return CreateEventResponse(event_id=event_id, job_ids=job_ids)
