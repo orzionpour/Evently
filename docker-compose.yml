@@ -13,6 +13,20 @@ services:
       timeout: 5s
       retries: 20
 
+  migrate:
+    image: migrate/migrate:v4.17.1
+    depends_on:
+      postgres:
+        condition: service_healthy 
+    volumes:
+      - ./db/migrations:/migrations
+    command: [
+      "-path", "/migrations",
+      "-database", "postgres://evently:evently@postgres:5432/evently?sslmode=disable",
+      "up"
+    ]
+    restart: "no"
+
   rabbitmq:
     image: rabbitmq:3.13-management
     ports:
