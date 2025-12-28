@@ -1,0 +1,68 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: evently
+      POSTGRES_PASSWORD: evently
+      POSTGRES_DB: evently
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evently -d evently"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    image: migrate/migrate:v4.17.1
+    depends_on:
+      postgres:
+        condition: service_healthy 
+    volumes:
+      - ./db/migrations:/migrations
+    command: [
+      "-path", "/migrations",
+      "-database", "postgres://evently:evently@postgres:5432/evently?sslmode=disable",
+      "up"
+    ]
+    restart: "no"
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  evently-api:
+    build:
+      context: ./services/evently-api
+    environment:
+      # wired now; not used until later tasks
+      DATABASE_URL: postgres://evently:evently@postgres:5432/evently
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  evently-worker:
+    build:
+      context: ./services/evently-worker
+    environment:
+      # wired now; not used until later tasks
+      DATABASE_URL: postgres://evently:evently@postgres:5432/evently
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
